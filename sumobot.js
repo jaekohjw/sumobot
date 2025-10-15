@@ -167,9 +167,10 @@ function selectBestStrategy() {
 
 function executeEngagedStance(currentLoop) {
     if (!isEnemyAhead()) {
+        // This is a failsafe. The main loop should catch this, but if not,
+        // stop and switch to searching.
         ev3_motorStop(leftMotor);
         ev3_motorStop(rightMotor);
-        ev3_pause(500);
         robotState_stance = 'SEARCHING';
         return;
     }
@@ -246,8 +247,15 @@ while (true) {
     if (inDanger && currentStance !== 'ENGAGED') {
         escape();
     } else if (currentStance === 'ENGAGED' && !enemyVisible) {
+        // Smart Victory/Dodge detection
+        if (isInDangerZone()) {
+            // VICTORY: Enemy disappeared at the edge.
+            robotState_confidence = Math.min(10, robotState_confidence + 1);
+        } else {
+            // DODGE: Enemy disappeared in the center.
+            robotState_confidence = Math.max(0, robotState_confidence - 2);
+        }
         robotState_stance = 'SEARCHING';
-        robotState_confidence = Math.min(10, robotState_confidence + 1);
     } else if (enemyVisible) {
         robotState_stance = 'ENGAGED';
     } else if (currentStance !== 'INIT') {
