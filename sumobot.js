@@ -14,21 +14,33 @@ const CONFIG_hookPushDifferential = 150;
 const CONFIG_baseGyroPGain = 2.5;
 const CONFIG_gyroRateFailureThreshold = 30;
 
+// --- Enemy Analysis Config ---
+const CONFIG_spinnerGyroRateThreshold = 150; // High rate of spin suggests a spinner opponent
+
 // --- Positional Awareness Config ---
 const CONFIG_dangerThreshold = 4; // Yellow Ring
 
 // --- Color, Enemy, and Attack Constants ---
-const COLOR_BLUE = 2; const COLOR_GREEN = 3; const COLOR_YELLOW = 4;
-const COLOR_RED = 5; const COLOR_WHITE = 6;
-const ATTACK_STRAIGHT_PUSH = 'STRAIGHT_PUSH'; const ATTACK_HOOK_LEFT = 'HOOK_LEFT';
+const COLOR_BLUE = 2;
+const COLOR_GREEN = 3;
+const COLOR_YELLOW = 4;
+const COLOR_RED = 5;
+const COLOR_WHITE = 6;
+const ENEMY_TYPE_UNKNOWN = 'UNKNOWN';
+const ENEMY_TYPE_SPINNER = 'SPINNER';
+const ENEMY_TYPE_BRICK = 'BRICK';
+const ATTACK_STRAIGHT_PUSH = 'STRAIGHT_PUSH';
+const ATTACK_HOOK_LEFT = 'HOOK_LEFT';
 const ATTACK_HOOK_RIGHT = 'HOOK_RIGHT';
 
 
 // =================================================================================
 // --- Hardware & State Management ---
 // =================================================================================
-const leftMotor = ev3_motorB(); const rightMotor = ev3_motorC();
-const eyes = ev3_ultrasonicSensor(); const gyro = ev3_gyroSensor();
+const leftMotor = ev3_motorB();
+const rightMotor = ev3_motorC();
+const eyes = ev3_ultrasonicSensor();
+const gyro = ev3_gyroSensor();
 const colorSensor = ev3_colorSensor();
 
 ev3_motorSetStopAction(leftMotor, "brake");
@@ -41,13 +53,23 @@ let robotState_currentAttack = null;
 let robotState_stallStartLoopCount = 0;
 let robotState_attackHeading = 0;
 let robotState_dangerLevel = 0;
+let robotState_enemyType = ENEMY_TYPE_UNKNOWN;
+let robotState_lastKnownEnemyAngle = 0;
 
 
 // =================================================================================
 // --- Core Helper & Utility Functions ---
 // =================================================================================
 
-function isEnemyAhead() { return ev3_ultrasonicSensorDistance(eyes) < CONFIG_enemyDistanceCm; }
+function isEnemyAhead() {
+    const dist = ev3_ultrasonicSensorDistance(eyes);
+    if (dist < CONFIG_enemyDistanceCm) {
+        // Memory: If we see the enemy, record our current heading.
+        robotState_lastKnownEnemyAngle = ev3_gyroSensorAngle(gyro);
+        return true;
+    }
+    return false;
+}
 
 function updatePositionalAwareness() {
     const currentColor = ev3_colorSensorGetColor(colorSensor);
@@ -59,12 +81,18 @@ function updatePositionalAwareness() {
     else { robotState_dangerLevel = 0; }
 }
 
-function isInDangerZone() { return robotState_dangerLevel >= CONFIG_dangerThreshold; }
+function isInDangerZone() {
+    return robotState_dangerLevel >= CONFIG_dangerThreshold;
+}
 
 function isStalled(currentLoop) {
     if (robotState_stance === 'ENGAGED' && Math.abs(ev3_motorGetSpeed(leftMotor)) < 15) {
-        if (robotState_stallStartLoopCount === 0) { robotState_stallStartLoopCount = currentLoop; }
-        if (currentLoop - robotState_stallStartLoopCount >= CONFIG_stallLoops) { return true; }
+        if (robotState_stallStartLoopCount === 0) {
+            robotState_stallStartLoopCount = currentLoop;
+        }
+        if (currentLoop - robotState_stallStartLoopCount >= CONFIG_stallLoops) {
+            return true;
+        }
     } else {
         robotState_stallStartLoopCount = 0;
     }
@@ -75,9 +103,41 @@ function isStalled(currentLoop) {
 // --- Driving Primitives & AI Behaviors ---
 // =================================================================================
 
-function driveStraight(speed) { ev3_motorSetSpeed(leftMotor, speed); ev3_motorSetSpeed(rightMotor, speed); ev3_motorStart(leftMotor); ev3_motorStart(rightMotor); }
-function turnWithGyro(relativeAngle, turnSpeed) { const startAngle = ev3_gyroSensorAngle(gyro); const targetAngle = startAngle + relativeAngle; const turnDirection = (relativeAngle > 0) ? 1 : -1; ev3_motorSetSpeed(leftMotor, -turnSpeed * turnDirection); ev3_motorSetSpeed(rightMotor, turnSpeed * turnDirection); ev3_motorStart(leftMotor); ev3_motorStart(rightMotor); while (Math.abs(ev3_gyroSensorAngle(gyro) - startAngle) < Math.abs(relativeAngle)) { ev3_pause(10); } ev3_motorStop(leftMotor); ev3_motorStop(rightMotor); }
-function driveHook(direction) { const fastSpeed = CONFIG_baseAttackSpeed; const slowSpeed = fastSpeed - CONFIG_hookPushDifferential; if (direction === 'left') { ev3_motorSetSpeed(leftMotor, slowSpeed); ev3_motorSetSpeed(rightMotor, fastSpeed); } else { ev3_motorSetSpeed(leftMotor, fastSpeed); ev3_motorSetSpeed(rightMotor, slowSpeed); } ev3_motorStart(leftMotor); ev3_motorStart(rightMotor); }
+function driveStraight(speed) {
+    ev3_motorSetSpeed(leftMotor, speed);
+    ev3_motorSetSpeed(rightMotor, speed);
+    ev3_motorStart(leftMotor);
+    ev3_motorStart(rightMotor);
+}
+
+function turnWithGyro(relativeAngle, turnSpeed) {
+    const startAngle = ev3_gyroSensorAngle(gyro);
+    const targetAngle = startAngle + relativeAngle;
+    const turnDirection = (relativeAngle > 0) ? 1 : -1;
+    ev3_motorSetSpeed(leftMotor, -turnSpeed * turnDirection);
+    ev3_motorSetSpeed(rightMotor, turnSpeed * turnDirection);
+    ev3_motorStart(leftMotor);
+    ev3_motorStart(rightMotor);
+    while (Math.abs(ev3_gyroSensorAngle(gyro) - startAngle) < Math.abs(relativeAngle)) {
+        ev3_pause(10);
+    }
+    ev3_motorStop(leftMotor);
+    ev3_motorStop(rightMotor);
+}
+
+function driveHook(direction) {
+    const fastSpeed = CONFIG_baseAttackSpeed;
+    const slowSpeed = fastSpeed - CONFIG_hookPushDifferential;
+    if (direction === 'left') {
+        ev3_motorSetSpeed(leftMotor, slowSpeed);
+        ev3_motorSetSpeed(rightMotor, fastSpeed);
+    } else {
+        ev3_motorSetSpeed(leftMotor, fastSpeed);
+        ev3_motorSetSpeed(rightMotor, slowSpeed);
+    }
+    ev3_motorStart(leftMotor);
+    ev3_motorStart(rightMotor);
+}
 
 function escape() {
     driveStraight(-800);
@@ -87,15 +147,56 @@ function escape() {
     robotState_stance = 'SEARCHING';
 }
 
-function selectBestStrategy() { return ATTACK_STRAIGHT_PUSH; } // Simplified for clarity
+function analyzeEnemyType() {
+    if (robotState_enemyType === ENEMY_TYPE_UNKNOWN) {
+        const rotationRate = ev3_gyroSensorRate(gyro);
+        if (Math.abs(rotationRate) > CONFIG_spinnerGyroRateThreshold) {
+            robotState_enemyType = ENEMY_TYPE_SPINNER;
+            robotState_confidence = Math.max(0, robotState_confidence - 2);
+        } else if (isStalled(0)) {
+            robotState_enemyType = ENEMY_TYPE_BRICK;
+        }
+    }
+}
+
+function selectBestStrategy() {
+    if (robotState_enemyType === ENEMY_TYPE_SPINNER) {
+        return (Math.random() < 0.5) ? ATTACK_HOOK_LEFT : ATTACK_HOOK_RIGHT;
+    }
+    if (robotState_confidence < 7) {
+        return (Math.random() < 0.5) ? ATTACK_HOOK_LEFT : ATTACK_HOOK_RIGHT;
+    }
+    return ATTACK_STRAIGHT_PUSH;
+}
+
+function turnToAbsoluteAngle(targetAngle, turnSpeed) {
+    let error = targetAngle - ev3_gyroSensorAngle(gyro);
+    while (error > 180) { error -= 360; }
+    while (error < -180) { error += 360; }
+    turnWithGyro(error, turnSpeed);
+}
 
 // =================================================================================
 // --- Stance Execution Logic ---
 // =================================================================================
 
 function executeEngagedStance(currentLoop) {
-    if (!isEnemyAhead()) { ev3_motorStop(leftMotor); ev3_motorStop(rightMotor); ev3_pause(500); robotState_stance = 'SEARCHING'; return; }
-    if (robotState_previousStance !== "ENGAGED") { robotState_currentAttack = selectBestStrategy(); robotState_attackHeading = ev3_gyroSensorAngle(gyro); }
+    if (!isEnemyAhead()) {
+        ev3_motorStop(leftMotor);
+        ev3_motorStop(rightMotor);
+        ev3_pause(500);
+        robotState_stance = 'SEARCHING';
+        return;
+    }
+
+    if (robotState_previousStance !== "ENGAGED") {
+        robotState_currentAttack = selectBestStrategy();
+        robotState_attackHeading = ev3_gyroSensorAngle(gyro);
+    }
+
+    if (currentLoop - robotState_stateEnterLoopCount < 10) {
+        analyzeEnemyType();
+    }
 
     const isOverpowered = isStalled(currentLoop);
     const isLosingControl = Math.abs(ev3_gyroSensorRate(gyro)) > CONFIG_gyroRateFailureThreshold;
@@ -105,10 +206,9 @@ function executeEngagedStance(currentLoop) {
         return;
     }
     
-    let dynamicSpeed = CONFIG_baseAttackSpeed;
-    if (robotState_dangerLevel >= 5) { dynamicSpeed = CONFIG_baseAttackSpeed * 0.8; }
-    else if (robotState_dangerLevel >= 3) { dynamicSpeed = CONFIG_baseAttackSpeed * 0.9; }
-    else { dynamicSpeed = CONFIG_baseAttackSpeed * 1.1; }
+    let dynamicSpeed = CONFIG_baseAttackSpeed * (1 + (robotState_confidence - 5) / 50);
+    if (robotState_dangerLevel >= 5) { dynamicSpeed *= 0.8; }
+    else if (robotState_dangerLevel >= 3) { dynamicSpeed *= 0.9; }
 
     if (robotState_currentAttack === ATTACK_STRAIGHT_PUSH) {
         const currentAngle = ev3_gyroSensorAngle(gyro);
@@ -117,24 +217,44 @@ function executeEngagedStance(currentLoop) {
         const correction = error * (CONFIG_baseGyroPGain + (robotState_confidence / 10));
         ev3_motorSetSpeed(leftMotor, dynamicSpeed - correction);
         ev3_motorSetSpeed(rightMotor, dynamicSpeed + correction);
-        ev3_motorStart(leftMotor); ev3_motorStart(rightMotor);
+        ev3_motorStart(leftMotor);
+        ev3_motorStart(rightMotor);
     } else {
         driveHook(robotState_currentAttack === ATTACK_HOOK_LEFT ? 'left' : 'right');
     }
 }
 
 function executeSearchingStance(currentLoop) {
-    if (isInDangerZone()) { turnWithGyro(120, 400); }
-    else { ev3_motorSetSpeed(leftMotor, CONFIG_maxSearchSpeed); ev3_motorSetSpeed(rightMotor, -CONFIG_maxSearchSpeed); ev3_motorStart(leftMotor); ev3_motorStart(rightMotor); }
+    const timeInState = (currentLoop - robotState_stateEnterLoopCount) * CONFIG_LOOP_PAUSE_MS;
+
+    if (isInDangerZone()) {
+        turnWithGyro(120, 400);
+    } else if (timeInState < 1000) {
+        turnToAbsoluteAngle(robotState_lastKnownEnemyAngle, CONFIG_maxSearchSpeed);
+    } else {
+        ev3_motorSetSpeed(leftMotor, CONFIG_maxSearchSpeed * 0.7);
+        ev3_motorSetSpeed(rightMotor, -CONFIG_maxSearchSpeed * 0.7);
+        ev3_motorStart(leftMotor);
+        ev3_motorStart(rightMotor);
+    }
 }
 
-function deduceStartingPosition() { ev3_pause(100); if (isEnemyAhead()) { robotState_stance = 'ENGAGED'; } else { turnWithGyro(90, 300); robotState_stance = 'SEARCHING'; } }
+function deduceStartingPosition() {
+    ev3_pause(100);
+    if (isEnemyAhead()) {
+        robotState_stance = 'ENGAGED';
+    } else {
+        turnWithGyro(90, 300);
+        robotState_stance = 'SEARCHING';
+    }
+}
 
 // =================================================================================
 // --- Main Program Loop ---
 // =================================================================================
 ev3_waitForButtonPress();
 let loopCounter = 0;
+let robotState_stateEnterLoopCount = 0;
 
 while (true) {
     updatePositionalAwareness();
@@ -146,6 +266,7 @@ while (true) {
         escape();
     } else if (currentStance === 'ENGAGED' && !enemyVisible) {
         robotState_stance = 'SEARCHING';
+        robotState_confidence = Math.min(10, robotState_confidence + 1);
     } else if (enemyVisible) {
         robotState_stance = 'ENGAGED';
     } else if (currentStance !== 'INIT') {
@@ -154,14 +275,20 @@ while (true) {
     
     if (robotState_previousStance !== robotState_stance) {
         robotState_previousStance = robotState_stance;
+        robotState_stateEnterLoopCount = loopCounter;
         if (robotState_stance !== 'ENGAGED') {
-            ev3_motorStop(leftMotor); ev3_motorStop(rightMotor);
+            ev3_motorStop(leftMotor);
+            ev3_motorStop(rightMotor);
         }
     }
 
-    if (robotState_stance === 'ENGAGED') { executeEngagedStance(loopCounter); }
-    else if (robotState_stance === 'SEARCHING') { executeSearchingStance(loopCounter); }
-    else if (robotState_stance === 'INIT') { deduceStartingPosition(); }
+    if (robotState_stance === 'ENGAGED') {
+        executeEngagedStance(loopCounter);
+    } else if (robotState_stance === 'SEARCHING') {
+        executeSearchingStance(loopCounter);
+    } else if (robotState_stance === 'INIT') {
+        deduceStartingPosition();
+    }
 
     ev3_pause(CONFIG_LOOP_PAUSE_MS);
     loopCounter = loopCounter + 1;
