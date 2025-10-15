@@ -1,241 +1,168 @@
-#!/usr/bin/env node
-var ev3 = require('./node_modules/ev3source/ev3.js');
-var source = require('./node_modules/ev3source/source.js');
-
 // =================================================================================
 // --- Centralized Configuration & Strategies ---
 // =================================================================================
 
-// This object holds all tunable parameters for the robot's behavior.
-// Centralizing them here makes it easy to fine-tune the robot without searching the code.
-const config = {
-    DEBUG: false,
-    maxSearchSpeed: 400,
-    baseAttackSpeed: 1000,
-    escapeSpeed: -800,
-    gyroPGain: 2.5,
-    dangerThreshold: 5,
-    enemyDistanceCm: 50,
-    gyroTurnSpeed: 400,
-    hookPushDifferential: 150,
-    // --- TIME-BASED TIMINGS (in milliseconds) ---
-    stallTimeMs: 500,               // Time until a stall is confirmed
-    matchDurationMs: 60000,           // 60-second match length
-    desperationModeStartTimeMs: 45000,  // When to enter desperation mode
-    stateTimeoutMs: 8000,             // Time in a state before a reset is considered
-    targetConfirmMs: 200,             // Time to confirm a target is real
-    attackSuccessTimeMs: 1500,        // Time an attack must run to be a "success"
-    riposteRiskThreshold: 10          // Risk score below which a riposte is attempted
-};
+// --- LOOP-BASED TIMINGS ---
+const CONFIG_LOOP_PAUSE_MS = 20;
+const CONFIG_stallLoops = 25;
 
-// Defines available attack patterns and their effectiveness scores.
-const attackStrategies = {
-    'STRAIGHT_PUSH': { score: 15, name: 'STRAIGHT_PUSH' },
-    'HOOK_LEFT':     { score: 10, name: 'HOOK_LEFT' },
-    'HOOK_RIGHT':    { score: 10, name: 'HOOK_RIGHT' }
-};
+// --- General Configuration ---
+const CONFIG_maxSearchSpeed = 400;
+const CONFIG_baseAttackSpeed = 1000;
+const CONFIG_enemyDistanceCm = 50;
+const CONFIG_hookPushDifferential = 150;
+const CONFIG_baseGyroPGain = 2.5;
+const CONFIG_gyroRateFailureThreshold = 30;
+
+// --- Positional Awareness Config ---
+const CONFIG_dangerThreshold = 4; // Yellow Ring
+
+// --- Color, Enemy, and Attack Constants ---
+const COLOR_BLUE = 2; const COLOR_GREEN = 3; const COLOR_YELLOW = 4;
+const COLOR_RED = 5; const COLOR_WHITE = 6;
+const ATTACK_STRAIGHT_PUSH = 'STRAIGHT_PUSH'; const ATTACK_HOOK_LEFT = 'HOOK_LEFT';
+const ATTACK_HOOK_RIGHT = 'HOOK_RIGHT';
+
 
 // =================================================================================
 // --- Hardware & State Management ---
 // =================================================================================
-const leftMotor = ev3.motorB();
-const rightMotor = ev3.motorC();
-const eyes = ev3.ultrasonicSensor();
-const gyro = ev3.gyroSensor();
-const colorSensor = ev3.colorSensor();
+const leftMotor = ev3_motorB(); const rightMotor = ev3_motorC();
+const eyes = ev3_ultrasonicSensor(); const gyro = ev3_gyroSensor();
+const colorSensor = ev3_colorSensor();
 
-// Use "brake" for precise stops.
-ev3.motorSetStopAction(leftMotor, "brake");
-ev3.motorSetStopAction(rightMotor, "brake");
+ev3_motorSetStopAction(leftMotor, "brake");
+ev3_motorSetStopAction(rightMotor, "brake");
 
-// Reset gyro at startup for an accurate zero-point.
-ev3.gyroSensorReset(gyro);
-source.alert("Gyro calibrated.");
-ev3.sleep(2000);
+let robotState_stance = 'INIT';
+let robotState_previousStance = null;
+let robotState_confidence = 10;
+let robotState_currentAttack = null;
+let robotState_stallStartLoopCount = 0;
+let robotState_attackHeading = 0;
+let robotState_dangerLevel = 0;
 
-// Holds all dynamic variables for the robot's state and memory.
-const robotState = {
-    stance: 'INIT',                 // The robot's primary mode: INIT, SEARCHING, or ENGAGED.
-    previousStance: null,
-    targetLockTime: 0,              // Timestamp when an opponent was first seen.
-    torqueConfidence: 10,           // Confidence in winning a head-on push.
-    currentAttack: null,            // The currently executing attack strategy.
-    lastAttackSuccessCheck: 0,
-    stallStartTime: 0,
-    stateEnterTime: 0,
-    centerVector: 0,                // Gyro angle pointing towards the arena center.
-    isPassivelyScanning: false,     // Flag for the initial 360-degree mapping turn.
-    passiveScanStartAngle: 0
-};
-
-let powerMultiplier = 1.0; // Battery compensation factor.
 
 // =================================================================================
-// --- Helper & Utility Functions ---
+// --- Core Helper & Utility Functions ---
 // =================================================================================
-// NOTE: All helper functions are assumed to be here, now using Date.now() for timing.
-// This includes: getDynamicSpeed, driveStraight, isStalled (using Date.now()),
-// getDangerLevel, inDangerZone, isEnemyAhead, turnWithGyro, driveHook,
-// calculateRiskScore, escape, riposte, deduceStartingPosition, etc.
 
-/**
- * Selects the best attack strategy based on the Juggernaut's confidence.
- * @returns {object} The strategy object to be executed.
- */
-function selectBestStrategy() {
-    // If torque confidence is high, always favor the dominant straight push.
-    if (robotState.torqueConfidence > 5) {
-        return attackStrategies.STRAIGHT_PUSH;
-    }
-    // If confidence is low, fall back to the highest-scoring hook maneuver.
-    let bestStrategy = attackStrategies.HOOK_LEFT;
-    if (attackStrategies.HOOK_RIGHT.score > attackStrategies.HOOK_LEFT.score) {
-        bestStrategy = attackStrategies.HOOK_RIGHT;
-    }
-    return bestStrategy;
+function isEnemyAhead() { return ev3_ultrasonicSensorDistance(eyes) < CONFIG_enemyDistanceCm; }
+
+function updatePositionalAwareness() {
+    const currentColor = ev3_colorSensorGetColor(colorSensor);
+    if (currentColor === COLOR_WHITE) { robotState_dangerLevel = 6; }
+    else if (currentColor === COLOR_RED) { robotState_dangerLevel = 5; }
+    else if (currentColor === COLOR_YELLOW) { robotState_dangerLevel = 4; }
+    else if (currentColor === COLOR_GREEN) { robotState_dangerLevel = 2; }
+    else if (currentColor === COLOR_BLUE) { robotState_dangerLevel = 1; }
+    else { robotState_dangerLevel = 0; }
 }
+
+function isInDangerZone() { return robotState_dangerLevel >= CONFIG_dangerThreshold; }
+
+function isStalled(currentLoop) {
+    if (robotState_stance === 'ENGAGED' && Math.abs(ev3_motorGetSpeed(leftMotor)) < 15) {
+        if (robotState_stallStartLoopCount === 0) { robotState_stallStartLoopCount = currentLoop; }
+        if (currentLoop - robotState_stallStartLoopCount >= CONFIG_stallLoops) { return true; }
+    } else {
+        robotState_stallStartLoopCount = 0;
+    }
+    return false;
+}
+
+// =================================================================================
+// --- Driving Primitives & AI Behaviors ---
+// =================================================================================
+
+function driveStraight(speed) { ev3_motorSetSpeed(leftMotor, speed); ev3_motorSetSpeed(rightMotor, speed); ev3_motorStart(leftMotor); ev3_motorStart(rightMotor); }
+function turnWithGyro(relativeAngle, turnSpeed) { const startAngle = ev3_gyroSensorAngle(gyro); const targetAngle = startAngle + relativeAngle; const turnDirection = (relativeAngle > 0) ? 1 : -1; ev3_motorSetSpeed(leftMotor, -turnSpeed * turnDirection); ev3_motorSetSpeed(rightMotor, turnSpeed * turnDirection); ev3_motorStart(leftMotor); ev3_motorStart(rightMotor); while (Math.abs(ev3_gyroSensorAngle(gyro) - startAngle) < Math.abs(relativeAngle)) { ev3_pause(10); } ev3_motorStop(leftMotor); ev3_motorStop(rightMotor); }
+function driveHook(direction) { const fastSpeed = CONFIG_baseAttackSpeed; const slowSpeed = fastSpeed - CONFIG_hookPushDifferential; if (direction === 'left') { ev3_motorSetSpeed(leftMotor, slowSpeed); ev3_motorSetSpeed(rightMotor, fastSpeed); } else { ev3_motorSetSpeed(leftMotor, fastSpeed); ev3_motorSetSpeed(rightMotor, slowSpeed); } ev3_motorStart(leftMotor); ev3_motorStart(rightMotor); }
+
+function escape() {
+    driveStraight(-800);
+    ev3_pause(500);
+    const turnAngle = (robotState_dangerLevel >= 6) ? 150 : 120;
+    turnWithGyro(turnAngle, 400);
+    robotState_stance = 'SEARCHING';
+}
+
+function selectBestStrategy() { return ATTACK_STRAIGHT_PUSH; } // Simplified for clarity
 
 // =================================================================================
 // --- Stance Execution Logic ---
 // =================================================================================
 
-/**
- * Handles all logic when the robot is actively engaged with an opponent.
- */
-function executeEngagedStance() {
-    // This runs once when the stance is first entered.
-    if (robotState.previousStance !== "ENGAGED") {
-        robotState.currentAttack = selectBestStrategy();
-        source.alert("Engaged: " + robotState.currentAttack.name);
-        robotState.stallStartTime = 0;
-        robotState.lastAttackSuccessCheck = Date.now();
-    }
-    
-    const isCurrentlyStalled = isStalled(); // isStalled() now uses Date.now()
+function executeEngagedStance(currentLoop) {
+    if (!isEnemyAhead()) { ev3_motorStop(leftMotor); ev3_motorStop(rightMotor); ev3_pause(500); robotState_stance = 'SEARCHING'; return; }
+    if (robotState_previousStance !== "ENGAGED") { robotState_currentAttack = selectBestStrategy(); robotState_attackHeading = ev3_gyroSensorAngle(gyro); }
 
-    // If the current push is successful, increase our confidence.
-    if (!isCurrentlyStalled) {
-        if (Date.now() - robotState.lastAttackSuccessCheck > config.attackSuccessTimeMs) {
-            if (robotState.currentAttack.name === 'STRAIGHT_PUSH') {
-                 robotState.torqueConfidence = Math.min(20, robotState.torqueConfidence + 5);
-            }
-            robotState.lastAttackSuccessCheck = Date.now();
-        }
+    const isOverpowered = isStalled(currentLoop);
+    const isLosingControl = Math.abs(ev3_gyroSensorRate(gyro)) > CONFIG_gyroRateFailureThreshold;
+    if (isOverpowered || (robotState_currentAttack === ATTACK_STRAIGHT_PUSH && isLosingControl)) {
+        robotState_confidence = Math.max(0, robotState_confidence - 5);
+        robotState_stance = 'SEARCHING';
+        return;
     }
     
-    // Execute the attack, steering the opponent out using the Pressure Vector.
-    if (robotState.currentAttack.name === 'STRAIGHT_PUSH') {
-        const pressureVector = (robotState.centerVector + 180) % 360;
-        robotState.targetHeading = pressureVector;
-        driveStraight(getDynamicSpeed(config.baseAttackSpeed));
-    } else if (robotState.currentAttack.name === 'HOOK_LEFT') {
-        driveHook('left');
+    let dynamicSpeed = CONFIG_baseAttackSpeed;
+    if (robotState_dangerLevel >= 5) { dynamicSpeed = CONFIG_baseAttackSpeed * 0.8; }
+    else if (robotState_dangerLevel >= 3) { dynamicSpeed = CONFIG_baseAttackSpeed * 0.9; }
+    else { dynamicSpeed = CONFIG_baseAttackSpeed * 1.1; }
+
+    if (robotState_currentAttack === ATTACK_STRAIGHT_PUSH) {
+        const currentAngle = ev3_gyroSensorAngle(gyro);
+        let error = robotState_attackHeading - currentAngle;
+        if (error > 180) { error = error - 360; } else if (error < -180) { error = error + 360; }
+        const correction = error * (CONFIG_baseGyroPGain + (robotState_confidence / 10));
+        ev3_motorSetSpeed(leftMotor, dynamicSpeed - correction);
+        ev3_motorSetSpeed(rightMotor, dynamicSpeed + correction);
+        ev3_motorStart(leftMotor); ev3_motorStart(rightMotor);
     } else {
-        driveHook('right');
-    }
-    
-    // If we stall, confidence is broken. Flank and switch to searching.
-    if (isCurrentlyStalled) {
-        source.alert("Stalled! Confidence broken.");
-        if (robotState.currentAttack.name === 'STRAIGHT_PUSH') robotState.torqueConfidence = 0;
-        turnWithGyro(Math.random() < 0.5 ? 45 : -45);
-        robotState.stance = 'SEARCHING';
+        driveHook(robotState_currentAttack === ATTACK_HOOK_LEFT ? 'left' : 'right');
     }
 }
 
-/**
- * Handles all logic when no opponent is visible.
- * It searches for a target while safely mapping the arena.
- */
-function executeSearchingStance() {
-    // This runs once when the stance is first entered.
-    if (robotState.previousStance !== "SEARCHING") {
-        source.alert("Stance: Searching");
-        // Begin a 360-degree turn to passively map the arena.
-        robotState.isPassivelyScanning = true;
-        robotState.passiveScanStartAngle = ev3.gyroSensorAngle(gyro);
-        ev3.run(leftMotor, -getDynamicSpeed(config.maxSearchSpeed));
-        ev3.run(rightMotor, getDynamicSpeed(config.maxSearchSpeed));
-    }
-
-    // While turning, passively update the center vector if a safe color is seen.
-    if (robotState.isPassivelyScanning) {
-        const currentAngle = ev3.gyroSensorAngle(gyro);
-        if (getDangerLevel() <= 2) {
-            robotState.centerVector = currentAngle;
-        }
-        // End the passive scan after a full circle.
-        if (Math.abs(currentAngle - robotState.passiveScanStartAngle) >= 350) {
-            robotState.isPassivelyScanning = false;
-            ev3.motorStop(leftMotor);
-            ev3.motorStop(rightMotor);
-        }
-    } else {
-        // After the initial scan, use a more methodical "Pulse Search".
-        turnWithGyro(90);
-        ev3.sleep(150);
-    }
+function executeSearchingStance(currentLoop) {
+    if (isInDangerZone()) { turnWithGyro(120, 400); }
+    else { ev3_motorSetSpeed(leftMotor, CONFIG_maxSearchSpeed); ev3_motorSetSpeed(rightMotor, -CONFIG_maxSearchSpeed); ev3_motorStart(leftMotor); ev3_motorStart(rightMotor); }
 }
+
+function deduceStartingPosition() { ev3_pause(100); if (isEnemyAhead()) { robotState_stance = 'ENGAGED'; } else { turnWithGyro(90, 300); robotState_stance = 'SEARCHING'; } }
 
 // =================================================================================
 // --- Main Program Loop ---
 // =================================================================================
-source.alert("Ready! Press button.");
-ev3.waitForButtonPress();
-const matchStartTime = Date.now();
+ev3_waitForButtonPress();
+let loopCounter = 0;
 
-while (Date.now() - matchStartTime < config.matchDurationMs) {
+while (true) {
+    updatePositionalAwareness();
+    const inDanger = isInDangerZone();
     const enemyVisible = isEnemyAhead();
-    const inDanger = inDangerZone();
+    const currentStance = robotState_stance;
 
-    // --- Stance Transition Logic (The Robot's Brain) ---
-    // PRIORITY 1: DANGER. Survival comes first.
-    if (inDanger) {
-        const riskScore = calculateRiskScore();
-        if (riskScore < config.riposteRiskThreshold) {
-            riposte();
-        } else {
-            escape();
-        }
-        robotState.stance = 'SEARCHING';
-    
-    // PRIORITY 2: ENEMY SIGHTED. Confirm and engage.
+    if (inDanger && currentStance !== 'ENGAGED') {
+        escape();
+    } else if (currentStance === 'ENGAGED' && !enemyVisible) {
+        robotState_stance = 'SEARCHING';
     } else if (enemyVisible) {
-        if (robotState.targetLockTime === 0) robotState.targetLockTime = Date.now();
-        if (Date.now() - robotState.targetLockTime >= config.targetConfirmMs) {
-            robotState.stance = 'ENGAGED';
+        robotState_stance = 'ENGAGED';
+    } else if (currentStance !== 'INIT') {
+        robotState_stance = 'SEARCHING';
+    }
+    
+    if (robotState_previousStance !== robotState_stance) {
+        robotState_previousStance = robotState_stance;
+        if (robotState_stance !== 'ENGAGED') {
+            ev3_motorStop(leftMotor); ev3_motorStop(rightMotor);
         }
-    
-    // PRIORITY 3: ALL CLEAR. Search for a target.
-    } else {
-        robotState.targetLockTime = 0;
-        robotState.stance = 'SEARCHING';
-    }
-    
-    // --- Stance Execution ---
-    const currentStance = robotState.stance;
-    // Detect when a stance changes to run setup code.
-    if (robotState.previousStance !== currentStance) {
-        robotState.stateEnterTime = Date.now();
-        robotState.previousStance = currentStance;
-        ev3.motorStop(leftMotor);
-        ev3.motorStop(rightMotor);
     }
 
-    if (currentStance === 'ENGAGED') {
-        executeEngagedStance();
-    } else if (currentStance === 'SEARCHING') {
-        executeSearchingStance();
-    } else if (currentStance === 'INIT') {
-        // Runs only once at the start of the match.
-        deduceStartingPosition();
-    }
+    if (robotState_stance === 'ENGAGED') { executeEngagedStance(loopCounter); }
+    else if (robotState_stance === 'SEARCHING') { executeSearchingStance(loopCounter); }
+    else if (robotState_stance === 'INIT') { deduceStartingPosition(); }
 
-    // A minimal pause to prevent the loop from overwhelming the processor.
-    ev3.sleep(20);
+    ev3_pause(CONFIG_LOOP_PAUSE_MS);
+    loopCounter = loopCounter + 1;
 }
-
-// Match timer has ended.
-source.alert("MATCH OVER");
-ev3.motorStop(leftMotor);
-ev3.motorStop(rightMotor);
