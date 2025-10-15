@@ -11,11 +11,11 @@ const CONFIG_maxSearchSpeed = 400;
 const CONFIG_baseAttackSpeed = 1000;
 const CONFIG_enemyDistanceCm = 50;
 const CONFIG_hookPushDifferential = 150;
-const CONFIG_baseGyroPGain = 2.5;
+const CONFIG_straightenPGain = 3.0; // Proportional gain for keeping gyro RATE at 0
 const CONFIG_gyroRateFailureThreshold = 30;
 
 // --- Enemy Analysis Config ---
-const CONFIG_spinnerGyroRateThreshold = 150; // High rate of spin suggests a spinner opponent
+const CONFIG_spinnerGyroRateThreshold = 150;
 
 // --- Positional Awareness Config ---
 const CONFIG_dangerThreshold = 4; // Yellow Ring
@@ -51,10 +51,9 @@ let robotState_previousStance = null;
 let robotState_confidence = 10;
 let robotState_currentAttack = null;
 let robotState_stallStartLoopCount = 0;
-let robotState_attackHeading = 0;
+let robotState_stateEnterLoopCount = 0;
 let robotState_dangerLevel = 0;
 let robotState_enemyType = ENEMY_TYPE_UNKNOWN;
-let robotState_lastKnownEnemyAngle = 0;
 
 
 // =================================================================================
@@ -62,13 +61,7 @@ let robotState_lastKnownEnemyAngle = 0;
 // =================================================================================
 
 function isEnemyAhead() {
-    const dist = ev3_ultrasonicSensorDistance(eyes);
-    if (dist < CONFIG_enemyDistanceCm) {
-        // Memory: If we see the enemy, record our current heading.
-        robotState_lastKnownEnemyAngle = ev3_gyroSensorAngle(gyro);
-        return true;
-    }
-    return false;
+    return ev3_ultrasonicSensorDistance(eyes) < CONFIG_enemyDistanceCm;
 }
 
 function updatePositionalAwareness() {
@@ -112,7 +105,6 @@ function driveStraight(speed) {
 
 function turnWithGyro(relativeAngle, turnSpeed) {
     const startAngle = ev3_gyroSensorAngle(gyro);
-    const targetAngle = startAngle + relativeAngle;
     const turnDirection = (relativeAngle > 0) ? 1 : -1;
     ev3_motorSetSpeed(leftMotor, -turnSpeed * turnDirection);
     ev3_motorSetSpeed(rightMotor, turnSpeed * turnDirection);
@@ -169,13 +161,6 @@ function selectBestStrategy() {
     return ATTACK_STRAIGHT_PUSH;
 }
 
-function turnToAbsoluteAngle(targetAngle, turnSpeed) {
-    let error = targetAngle - ev3_gyroSensorAngle(gyro);
-    while (error > 180) { error -= 360; }
-    while (error < -180) { error += 360; }
-    turnWithGyro(error, turnSpeed);
-}
-
 // =================================================================================
 // --- Stance Execution Logic ---
 // =================================================================================
@@ -191,7 +176,6 @@ function executeEngagedStance(currentLoop) {
 
     if (robotState_previousStance !== "ENGAGED") {
         robotState_currentAttack = selectBestStrategy();
-        robotState_attackHeading = ev3_gyroSensorAngle(gyro);
     }
 
     if (currentLoop - robotState_stateEnterLoopCount < 10) {
@@ -205,18 +189,19 @@ function executeEngagedStance(currentLoop) {
         robotState_stance = 'SEARCHING';
         return;
     }
-    
+
     let dynamicSpeed = CONFIG_baseAttackSpeed * (1 + (robotState_confidence - 5) / 50);
-    if (robotState_dangerLevel >= 5) { dynamicSpeed *= 0.8; }
-    else if (robotState_dangerLevel >= 3) { dynamicSpeed *= 0.9; }
+    if (robotState_dangerLevel >= 5) {
+        dynamicSpeed *= 0.8;
+    } else if (robotState_dangerLevel >= 3) {
+        dynamicSpeed *= 0.9;
+    }
 
     if (robotState_currentAttack === ATTACK_STRAIGHT_PUSH) {
-        const currentAngle = ev3_gyroSensorAngle(gyro);
-        let error = robotState_attackHeading - currentAngle;
-        if (error > 180) { error = error - 360; } else if (error < -180) { error = error + 360; }
-        const correction = error * (CONFIG_baseGyroPGain + (robotState_confidence / 10));
-        ev3_motorSetSpeed(leftMotor, dynamicSpeed - correction);
-        ev3_motorSetSpeed(rightMotor, dynamicSpeed + correction);
+        const rotationRate = ev3_gyroSensorRate(gyro);
+        const correction = rotationRate * CONFIG_straightenPGain;
+        ev3_motorSetSpeed(leftMotor, dynamicSpeed + correction);
+        ev3_motorSetSpeed(rightMotor, dynamicSpeed - correction);
         ev3_motorStart(leftMotor);
         ev3_motorStart(rightMotor);
     } else {
@@ -225,15 +210,11 @@ function executeEngagedStance(currentLoop) {
 }
 
 function executeSearchingStance(currentLoop) {
-    const timeInState = (currentLoop - robotState_stateEnterLoopCount) * CONFIG_LOOP_PAUSE_MS;
-
     if (isInDangerZone()) {
         turnWithGyro(120, 400);
-    } else if (timeInState < 1000) {
-        turnToAbsoluteAngle(robotState_lastKnownEnemyAngle, CONFIG_maxSearchSpeed);
     } else {
-        ev3_motorSetSpeed(leftMotor, CONFIG_maxSearchSpeed * 0.7);
-        ev3_motorSetSpeed(rightMotor, -CONFIG_maxSearchSpeed * 0.7);
+        ev3_motorSetSpeed(leftMotor, CONFIG_maxSearchSpeed);
+        ev3_motorSetSpeed(rightMotor, -CONFIG_maxSearchSpeed);
         ev3_motorStart(leftMotor);
         ev3_motorStart(rightMotor);
     }
@@ -272,7 +253,7 @@ while (true) {
     } else if (currentStance !== 'INIT') {
         robotState_stance = 'SEARCHING';
     }
-    
+
     if (robotState_previousStance !== robotState_stance) {
         robotState_previousStance = robotState_stance;
         robotState_stateEnterLoopCount = loopCounter;
